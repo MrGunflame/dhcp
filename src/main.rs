@@ -404,8 +404,8 @@ impl Decode for RequestedIpAddress {
 }
 
 // https://datatracker.ietf.org/doc/html/rfc1533#section-9.6
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct ParameterRequestList {}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ParameterRequestList(Vec<OptionCode>);
 
 impl Encode for u8 {
     fn encode<B>(&self, mut buf: B)
@@ -536,3 +536,252 @@ macro_rules! server_list_impl {
 }
 
 server_list_impl! { Routers, TimeServers, NameServers, DomainNameServers }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct BroadcastAddress(Ipv4Addr);
+
+impl Encode for BroadcastAddress {
+    fn encode<B>(&self, mut buf: B)
+    where
+        B: BufMut,
+    {
+        let len: u8 = 4;
+
+        len.encode(&mut buf);
+        self.0.encode(&mut buf);
+    }
+}
+
+impl Decode for BroadcastAddress {
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        let len = u8::decode(&mut buf)?;
+        Ipv4Addr::decode(buf).map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum OptionCode {
+    Pad,
+    End,
+    SubnetMask,
+    TimeOffset,
+    Router,
+    TimeServer,
+    NameServer,
+    DomainNameServer,
+    LogServer,
+    CookieServer,
+    LprServer,
+    ImpressServer,
+    ResourceLocationServer,
+    HostName,
+    BootFileSize,
+    MeritDumpFile,
+    DomainName,
+    SwapServer,
+    RootPath,
+    ExtensionsPath,
+    IpForwarding,
+    NonLocalSourceRouting,
+    PolicyFilter,
+    MaximumDatagramReassemblySize,
+    DefaultIpTtl,
+    PathMtuAgingTimeout,
+    PathMtuPlateuTable,
+    InterfaceMtu,
+    AllSubnetsAreLocal,
+    BroadcastAddress,
+    PerformMaskDiscovery,
+    MaskSupplier,
+    PerformRouterDiscovery,
+    RouterSolicitationAddress,
+    StaticRoute,
+    TrailerEncapsulation,
+    ArpCacheTimeout,
+    EthernetEncapsulation,
+    TcpDefaultTtl,
+    TcpKeepaliveInterval,
+    TcpKeepaliveGarbage,
+    NetworkInformationServiceDomain,
+    NetworkInformationServers,
+    NetworkTimeProtocolServers,
+    VendorSpecificInformation,
+    NetBiosOverTcpIpNameServer,
+    NetBiosOverTcpIpDatagramDistributionServer,
+    NetBiosOverTcpIpNodeType,
+    NetBiosOverTcpIpScope,
+    XWindowSystemFontServer,
+    XWindowSystemDisplayManager,
+    RequestedIpAddress,
+    IpAddressLeaseTime,
+    OptionOverload,
+    DhcpMessageType,
+    ServerIdentifier,
+    ParameterRequestList,
+    Message,
+    MaximumDhcpMessageSize,
+    RenewalTimeValue,
+    RebindingTimeValue,
+    ClassIdentifier,
+    ClientIdentifier,
+}
+
+impl Encode for OptionCode {
+    fn encode<B>(&self, buf: B)
+    where
+        B: BufMut,
+    {
+        self.to_u8().encode(buf);
+    }
+}
+
+impl OptionCode {
+    fn to_u8(self) -> u8 {
+        match self {
+            Self::Pad => 0,
+            Self::End => 255,
+            Self::SubnetMask => 1,
+            Self::TimeOffset => 2,
+            Self::Router => 3,
+            Self::TimeServer => 4,
+            Self::NameServer => 5,
+            Self::DomainNameServer => 6,
+            Self::LogServer => 7,
+            Self::CookieServer => 8,
+            Self::LprServer => 9,
+            Self::ImpressServer => 10,
+            Self::ResourceLocationServer => 11,
+            Self::HostName => 12,
+            Self::BootFileSize => 13,
+            Self::MeritDumpFile => 14,
+            Self::DomainName => 15,
+            Self::SwapServer => 16,
+            Self::RootPath => 17,
+            Self::ExtensionsPath => 18,
+            Self::IpForwarding => 19,
+            Self::NonLocalSourceRouting => 20,
+            Self::PolicyFilter => 21,
+            Self::MaximumDatagramReassemblySize => 22,
+            Self::DefaultIpTtl => 23,
+            Self::PathMtuAgingTimeout => 24,
+            Self::PathMtuPlateuTable => 25,
+            Self::InterfaceMtu => 26,
+            Self::AllSubnetsAreLocal => 27,
+            Self::BroadcastAddress => 28,
+            Self::PerformMaskDiscovery => 29,
+            Self::MaskSupplier => 30,
+            Self::PerformRouterDiscovery => 31,
+            Self::RouterSolicitationAddress => 32,
+            Self::StaticRoute => 33,
+            Self::TrailerEncapsulation => 34,
+            Self::ArpCacheTimeout => 35,
+            Self::EthernetEncapsulation => 36,
+            Self::TcpDefaultTtl => 37,
+            Self::TcpKeepaliveInterval => 38,
+            Self::TcpKeepaliveGarbage => 39,
+            Self::NetworkInformationServiceDomain => 40,
+            Self::NetworkInformationServers => 41,
+            Self::NetworkTimeProtocolServers => 42,
+            Self::VendorSpecificInformation => 43,
+            Self::NetBiosOverTcpIpNameServer => 44,
+            Self::NetBiosOverTcpIpDatagramDistributionServer => 45,
+            Self::NetBiosOverTcpIpNodeType => 46,
+            Self::NetBiosOverTcpIpScope => 47,
+            Self::XWindowSystemFontServer => 48,
+            Self::XWindowSystemDisplayManager => 49,
+            Self::RequestedIpAddress => 50,
+            Self::IpAddressLeaseTime => 51,
+            Self::OptionOverload => 52,
+            Self::DhcpMessageType => 53,
+            Self::ServerIdentifier => 54,
+            Self::ParameterRequestList => 55,
+            Self::Message => 56,
+            Self::MaximumDhcpMessageSize => 57,
+            Self::RenewalTimeValue => 58,
+            Self::RebindingTimeValue => 59,
+            Self::ClassIdentifier => 60,
+            Self::ClientIdentifier => 61,
+        }
+    }
+
+    fn from_u8(code: u8) -> Result<Self, Error> {
+        match code {
+            0 => Ok(Self::Pad),
+            255 => Ok(Self::End),
+            1 => Ok(Self::SubnetMask),
+            2 => Ok(Self::TimeOffset),
+            3 => Ok(Self::Router),
+            4 => Ok(Self::TimeServer),
+            5 => Ok(Self::NameServer),
+            6 => Ok(Self::DomainNameServer),
+            7 => Ok(Self::LogServer),
+            8 => Ok(Self::CookieServer),
+            9 => Ok(Self::LprServer),
+            10 => Ok(Self::ImpressServer),
+            11 => Ok(Self::ResourceLocationServer),
+            12 => Ok(Self::HostName),
+            13 => Ok(Self::BootFileSize),
+            14 => Ok(Self::MeritDumpFile),
+            15 => Ok(Self::DomainName),
+            16 => Ok(Self::SwapServer),
+            17 => Ok(Self::RootPath),
+            18 => Ok(Self::ExtensionsPath),
+            19 => Ok(Self::IpForwarding),
+            20 => Ok(Self::NonLocalSourceRouting),
+            21 => Ok(Self::PolicyFilter),
+            22 => Ok(Self::MaximumDatagramReassemblySize),
+            23 => Ok(Self::DefaultIpTtl),
+            24 => Ok(Self::PathMtuAgingTimeout),
+            25 => Ok(Self::PathMtuPlateuTable),
+            26 => Ok(Self::InterfaceMtu),
+            27 => Ok(Self::AllSubnetsAreLocal),
+            28 => Ok(Self::BroadcastAddress),
+            29 => Ok(Self::PerformMaskDiscovery),
+            30 => Ok(Self::MaskSupplier),
+            31 => Ok(Self::PerformRouterDiscovery),
+            32 => Ok(Self::RouterSolicitationAddress),
+            33 => Ok(Self::StaticRoute),
+            34 => Ok(Self::TrailerEncapsulation),
+            35 => Ok(Self::ArpCacheTimeout),
+            36 => Ok(Self::EthernetEncapsulation),
+            37 => Ok(Self::TcpDefaultTtl),
+            38 => Ok(Self::TcpKeepaliveInterval),
+            39 => Ok(Self::TcpKeepaliveGarbage),
+            40 => Ok(Self::NetworkInformationServiceDomain),
+            41 => Ok(Self::NetworkInformationServers),
+            42 => Ok(Self::NetworkTimeProtocolServers),
+            43 => Ok(Self::VendorSpecificInformation),
+            44 => Ok(Self::NetBiosOverTcpIpNameServer),
+            45 => Ok(Self::NetBiosOverTcpIpDatagramDistributionServer),
+            46 => Ok(Self::NetBiosOverTcpIpNodeType),
+            47 => Ok(Self::NetBiosOverTcpIpScope),
+            48 => Ok(Self::XWindowSystemFontServer),
+            49 => Ok(Self::XWindowSystemDisplayManager),
+            50 => Ok(Self::RequestedIpAddress),
+            51 => Ok(Self::IpAddressLeaseTime),
+            52 => Ok(Self::OptionOverload),
+            53 => Ok(Self::DhcpMessageType),
+            54 => Ok(Self::ServerIdentifier),
+            55 => Ok(Self::ParameterRequestList),
+            56 => Ok(Self::Message),
+            57 => Ok(Self::MaximumDhcpMessageSize),
+            58 => Ok(Self::RenewalTimeValue),
+            59 => Ok(Self::RebindingTimeValue),
+            60 => Ok(Self::ClassIdentifier),
+            61 => Ok(Self::ClientIdentifier),
+            _ => Err(Error::InvalidOption(code)),
+        }
+    }
+}
+
+impl Decode for OptionCode {
+    fn decode<B>(buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        Self::from_u8(u8::decode(buf)?)
+    }
+}
