@@ -1,14 +1,40 @@
+use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::{Buf, BufMut};
 use tokio::net::UdpSocket;
+
+const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
+
+pub struct State {
+    pool: Pool,
+    config: Config,
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    local_addr: Ipv4Addr,
+    routers: Vec<Ipv4Addr>,
+    dns: Vec<Ipv4Addr>,
+    broadcast: Ipv4Addr,
+    subnet: Ipv4Addr,
+}
 
 #[tokio::main]
 async fn main() {
     pretty_env_logger::init();
 
-    let state = ();
+    let mut state = State {
+        pool: Pool::new(HashMap::new()),
+        config: Config {
+            local_addr: Ipv4Addr::new(0, 0, 0, 0),
+            routers: vec![],
+            dns: vec![],
+            broadcast: Ipv4Addr::BROADCAST,
+            subnet: Ipv4Addr::new(255, 255, 255, 0),
+        },
+    };
 
     let socket = UdpSocket::bind("0.0.0.0:67").await.unwrap();
 
@@ -17,7 +43,270 @@ async fn main() {
         let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
         buf.truncate(len);
         tracing::info!("got packet from {:?}", addr);
+
+        let packet = match Packet::decode(&buf[..]) {
+            Ok(packet) => packet,
+            Err(err) => {
+                tracing::error!("failed to decode packet: {:?}", err);
+                continue;
+            }
+        };
+
+        handle_packet(&mut state, &socket, addr, packet).await;
     }
+}
+
+async fn handle_packet(state: &mut State, socket: &UdpSocket, addr: SocketAddr, packet: Packet) {
+    let Some(dhcp_type) = packet.options.get(&OptionCode::DhcpMessageType) else {
+        tracing::debug!("not a DHCP packet");
+        return;
+    };
+
+    // If the Server Identifier option is present we must only listen
+    // to messages directed at us.
+    if let Some(ident) = packet.options.get(&OptionCode::ServerIdentifier) {
+        let ident = match ident {
+            DhcpOption::ServerIdentifier(ident) => ident.0,
+            _ => {
+                tracing::trace!("malformed packet");
+                return;
+            }
+        };
+
+        if ident != state.config.local_addr {
+            return;
+        }
+    }
+
+    match dhcp_type {
+        DhcpOption::DhcpMessageType(typ) => match typ {
+            DhcpMessageType::Discover => handle_discover(state, socket, addr, packet).await,
+            DhcpMessageType::Request => handle_request(state, socket, addr, packet).await,
+            _ => (),
+        },
+        _ => (),
+    }
+}
+
+async fn handle_discover(
+    state: &mut State,
+    socket: &UdpSocket,
+    mut addr: SocketAddr,
+    packet: Packet,
+) {
+    let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
+        tracing::debug!("client has not requested any paramters");
+        return;
+    };
+
+    let params = match params {
+        DhcpOption::ParameterRequestList(params) => params,
+        _ => return,
+    };
+
+    let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
+        Some(opt) => match opt {
+            DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
+            _ => {
+                tracing::trace!("malformed packet");
+                return;
+            }
+        },
+        None => None,
+    };
+
+    let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
+
+    let ip = state.pool.request_addr(mac, requested_ip).unwrap();
+
+    let mut options = HashMap::new();
+    options.insert(
+        OptionCode::DhcpMessageType,
+        DhcpOption::DhcpMessageType(DhcpMessageType::Offer),
+    );
+    options.insert(
+        OptionCode::ServerIdentifier,
+        DhcpOption::ServerIdentifier(ServerIdentifier(state.config.local_addr)),
+    );
+    options.insert(
+        OptionCode::IpAddressLeaseTime,
+        DhcpOption::IpAddressLeaseTime(IpAddressLeaseTime(3600)),
+    );
+    options.insert(
+        OptionCode::RenewalTimeValue,
+        DhcpOption::RenewalTimeValue(RenewalTimeValue(1800)),
+    );
+    options.insert(
+        OptionCode::RebindingTimeValue,
+        DhcpOption::RebindingTimeValue(RebindingTimeValue(3150)),
+    );
+
+    for code in &params.0 {
+        match code {
+            OptionCode::SubnetMask => {
+                options.insert(
+                    OptionCode::SubnetMask,
+                    DhcpOption::SubnetMask(SubnetMask(state.config.subnet)),
+                );
+            }
+            OptionCode::BroadcastAddress => {
+                options.insert(
+                    OptionCode::BroadcastAddress,
+                    DhcpOption::BroadcastAddress(BroadcastAddress(state.config.broadcast)),
+                );
+            }
+            OptionCode::Router => {
+                options.insert(
+                    OptionCode::Router,
+                    DhcpOption::Routers(Routers(state.config.routers.clone())),
+                );
+            }
+            OptionCode::DomainNameServer => {
+                options.insert(
+                    OptionCode::DomainNameServer,
+                    DhcpOption::DomainNameServers(DomainNameServers(state.config.dns.clone())),
+                );
+            }
+            _ => (),
+        }
+    }
+
+    let resp = Packet {
+        op: Op::BootReply,
+        htype: 0x01,
+        hlen: 6,
+        hops: 0,
+        xid: packet.xid,
+        secs: 0,
+        flags: packet.flags,
+        ciaddr: packet.ciaddr,
+        yiaddr: ip,
+        siaddr: state.config.local_addr,
+        giaddr: packet.giaddr,
+        chaddr: packet.chaddr,
+        sname: [0; 64],
+        file: [0; 128],
+        options,
+    };
+
+    let mut buf = Vec::new();
+    resp.encode(&mut buf);
+
+    addr.set_ip(IpAddr::V4(ip));
+    socket.send_to(&buf, addr).await.unwrap();
+}
+
+async fn handle_request(
+    state: &mut State,
+    socket: &UdpSocket,
+    mut addr: SocketAddr,
+    packet: Packet,
+) {
+    let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
+        tracing::debug!("client has not requested any paramters");
+        return;
+    };
+
+    let params = match params {
+        DhcpOption::ParameterRequestList(params) => params,
+        _ => return,
+    };
+
+    let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
+        Some(opt) => match opt {
+            DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
+            _ => {
+                tracing::trace!("malformed packet");
+                return;
+            }
+        },
+        None => None,
+    };
+
+    let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
+
+    let ip = if packet.siaddr.is_unspecified() {
+        state.pool.request_addr(mac, requested_ip).unwrap()
+    } else {
+        // Client already has an address and wants to renew.
+        packet.siaddr
+    };
+
+    let mut options = HashMap::new();
+    options.insert(
+        OptionCode::DhcpMessageType,
+        DhcpOption::DhcpMessageType(DhcpMessageType::Ack),
+    );
+    options.insert(
+        OptionCode::ServerIdentifier,
+        DhcpOption::ServerIdentifier(ServerIdentifier(state.config.local_addr)),
+    );
+    options.insert(
+        OptionCode::IpAddressLeaseTime,
+        DhcpOption::IpAddressLeaseTime(IpAddressLeaseTime(3600)),
+    );
+    options.insert(
+        OptionCode::RenewalTimeValue,
+        DhcpOption::RenewalTimeValue(RenewalTimeValue(1800)),
+    );
+    options.insert(
+        OptionCode::RebindingTimeValue,
+        DhcpOption::RebindingTimeValue(RebindingTimeValue(3150)),
+    );
+
+    for code in &params.0 {
+        match code {
+            OptionCode::SubnetMask => {
+                options.insert(
+                    OptionCode::SubnetMask,
+                    DhcpOption::SubnetMask(SubnetMask(state.config.subnet)),
+                );
+            }
+            OptionCode::BroadcastAddress => {
+                options.insert(
+                    OptionCode::BroadcastAddress,
+                    DhcpOption::BroadcastAddress(BroadcastAddress(state.config.broadcast)),
+                );
+            }
+            OptionCode::Router => {
+                options.insert(
+                    OptionCode::Router,
+                    DhcpOption::Routers(Routers(state.config.routers.clone())),
+                );
+            }
+            OptionCode::DomainNameServer => {
+                options.insert(
+                    OptionCode::DomainNameServer,
+                    DhcpOption::DomainNameServers(DomainNameServers(state.config.dns.clone())),
+                );
+            }
+            _ => (),
+        }
+    }
+
+    let resp = Packet {
+        op: Op::BootReply,
+        htype: 0x01,
+        hlen: 6,
+        hops: 0,
+        xid: packet.xid,
+        secs: 0,
+        flags: packet.flags,
+        ciaddr: packet.ciaddr,
+        yiaddr: ip,
+        siaddr: state.config.local_addr,
+        giaddr: packet.giaddr,
+        chaddr: packet.chaddr,
+        sname: [0; 64],
+        file: [0; 128],
+        options,
+    };
+
+    let mut buf = Vec::new();
+    resp.encode(&mut buf);
+
+    addr.set_ip(IpAddr::V4(ip));
+    socket.send_to(&buf, addr).await.unwrap();
 }
 
 #[derive(Clone, Debug)]
@@ -37,10 +326,10 @@ pub struct Packet {
     pub siaddr: Ipv4Addr,
     pub giaddr: Ipv4Addr,
     /// Client hardware addr
-    pub chaddr: u128,
+    pub chaddr: [u8; 16],
     pub sname: [u8; 64],
     pub file: [u8; 128],
-    pub options: Vec<Option>,
+    pub options: HashMap<OptionCode, DhcpOption>,
 }
 
 impl Encode for Packet {
@@ -62,8 +351,9 @@ impl Encode for Packet {
         self.chaddr.encode(&mut buf);
         self.sname.encode(&mut buf);
         self.file.encode(&mut buf);
+        DHCP_MAGIC.encode(&mut buf);
 
-        for option in &self.options {
+        for (_, option) in &self.options {
             option.encode(&mut buf);
         }
     }
@@ -85,31 +375,44 @@ impl Decode for Packet {
         let yiaddr = Ipv4Addr::decode(&mut buf)?;
         let siaddr = Ipv4Addr::decode(&mut buf)?;
         let giaddr = Ipv4Addr::decode(&mut buf)?;
-        let chaddr = u128::decode(&mut buf)?;
+        let chaddr = <[u8; 16]>::decode(&mut buf)?;
         let sname = <[u8; 64]>::decode(&mut buf)?;
         let file = <[u8; 128]>::decode(&mut buf)?;
+        let magic = <[u8; 4]>::decode(&mut buf)?;
 
-        let mut options = Vec::new();
+        if magic != DHCP_MAGIC {
+            return Err(Error::InvalidMagic(magic));
+        }
+
+        let mut options = HashMap::new();
         loop {
             if !buf.has_remaining() {
                 return Err(Error::NotTerminated);
             }
 
             let code = u8::decode(&mut buf)?;
-            let option = match code {
+            let option = match OptionCode::from_u8(code) {
                 // Pad
-                0 => continue,
+                Ok(OptionCode::Pad) => continue,
                 // End
-                255 => break,
-                1 => Option::SubnetMask(SubnetMask::decode(&mut buf)?),
-                2 => Option::TimeOffset(TimeOffset::decode(&mut buf)?),
-                3 => Option::Routers(Routers::decode(&mut buf)?),
-                4 => Option::TimeServers(TimeServers::decode(&mut buf)?),
-                5 => Option::NameServers(NameServers::decode(&mut buf)?),
-                6 => Option::DomainNameServers(DomainNameServers::decode(&mut buf)?),
+                Ok(OptionCode::End) => break,
+                Ok(OptionCode::SubnetMask) => DhcpOption::SubnetMask(SubnetMask::decode(&mut buf)?),
+                Ok(OptionCode::TimeOffset) => DhcpOption::TimeOffset(TimeOffset::decode(&mut buf)?),
+                Ok(OptionCode::Router) => DhcpOption::Routers(Routers::decode(&mut buf)?),
+                Ok(OptionCode::TimeServer) => {
+                    DhcpOption::TimeServers(TimeServers::decode(&mut buf)?)
+                }
+                Ok(OptionCode::NameServer) => {
+                    DhcpOption::NameServers(NameServers::decode(&mut buf)?)
+                }
+                Ok(OptionCode::DomainNameServer) => {
+                    DhcpOption::DomainNameServers(DomainNameServers::decode(&mut buf)?)
+                }
                 _ => return Err(Error::InvalidOption(code)),
             };
-            options.push(option);
+
+            let code = OptionCode::from_u8(code).unwrap();
+            options.insert(code, option);
         }
 
         Ok(Self {
@@ -131,8 +434,6 @@ impl Decode for Packet {
         })
     }
 }
-
-async fn handle_packet(packet: Packet) {}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -167,32 +468,100 @@ impl Decode for Op {
     }
 }
 
-pub struct Pool {}
+pub struct Pool {
+    leases: HashMap<MacAddr, Ipv4Addr>,
+    addrs: HashSet<Ipv4Addr>,
+}
+
+impl Pool {
+    pub fn new(leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
+        let mut addrs = HashSet::with_capacity(leases.len());
+        for addr in leases.values() {
+            addrs.insert(*addr);
+        }
+
+        Self { leases, addrs }
+    }
+
+    pub fn request_addr(&mut self, mac: MacAddr, ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+        if let Some(ip) = ip {
+            if !self.addrs.contains(&ip) && self.is_valid_ip(ip) {
+                self.leases.insert(mac, ip);
+                self.addrs.insert(ip);
+
+                return Some(ip);
+            }
+        }
+
+        let ip = self.generate_ip()?;
+        self.leases.insert(mac, ip);
+        Some(ip)
+    }
+
+    pub fn mac_has_ip(&self, mac: MacAddr, ip: Ipv4Addr) -> bool {
+        if let Some(addr) = self.leases.get(&mac) {
+            *addr == ip
+        } else {
+            false
+        }
+    }
+
+    pub fn release_addr(&mut self, mac: MacAddr) {
+        if let Some(ip) = self.leases.remove(&mac) {
+            self.addrs.remove(&ip);
+        }
+    }
+
+    fn generate_ip(&mut self) -> Option<Ipv4Addr> {
+        todo!()
+    }
+
+    fn is_valid_ip(&self, ip: Ipv4Addr) -> bool {
+        true
+    }
+}
 
 #[derive(Clone, Debug)]
-pub enum Option {
+pub enum DhcpOption {
     SubnetMask(SubnetMask),
     TimeOffset(TimeOffset),
     Routers(Routers),
     TimeServers(TimeServers),
     NameServers(NameServers),
     DomainNameServers(DomainNameServers),
+    BroadcastAddress(BroadcastAddress),
+    // DHCP
+    RequestedIpAddress(RequestedIpAddress),
+    IpAddressLeaseTime(IpAddressLeaseTime),
+    DhcpMessageType(DhcpMessageType),
+    ServerIdentifier(ServerIdentifier),
+    ParameterRequestList(ParameterRequestList),
+    RenewalTimeValue(RenewalTimeValue),
+    RebindingTimeValue(RebindingTimeValue),
 }
 
-impl Encode for Option {
+impl Encode for DhcpOption {
     fn encode<B>(&self, mut buf: B)
     where
         B: BufMut,
     {
-        let tag: u8 = match self {
-            Self::SubnetMask(_) => 1,
-            Self::TimeOffset(_) => 2,
-            Self::Routers(_) => 3,
-            Self::TimeServers(_) => 4,
-            Self::NameServers(_) => 5,
-            Self::DomainNameServers(_) => 6,
+        let code = match self {
+            Self::SubnetMask(_) => OptionCode::SubnetMask,
+            Self::TimeOffset(_) => OptionCode::TimeOffset,
+            Self::Routers(_) => OptionCode::Router,
+            Self::TimeServers(_) => OptionCode::TimeServer,
+            Self::NameServers(_) => OptionCode::NameServer,
+            Self::DomainNameServers(_) => OptionCode::DomainNameServer,
+            Self::BroadcastAddress(_) => OptionCode::BroadcastAddress,
+            Self::RequestedIpAddress(_) => OptionCode::RequestedIpAddress,
+            Self::IpAddressLeaseTime(_) => OptionCode::IpAddressLeaseTime,
+            Self::DhcpMessageType(_) => OptionCode::DhcpMessageType,
+            Self::ServerIdentifier(_) => OptionCode::ServerIdentifier,
+            Self::ParameterRequestList(_) => OptionCode::ParameterRequestList,
+            Self::RenewalTimeValue(_) => OptionCode::RenewalTimeValue,
+            Self::RebindingTimeValue(_) => OptionCode::RebindingTimeValue,
         };
-        tag.encode(&mut buf);
+        code.encode(&mut buf);
 
         match self {
             Self::SubnetMask(v) => v.encode(buf),
@@ -201,12 +570,20 @@ impl Encode for Option {
             Self::TimeServers(v) => v.encode(buf),
             Self::NameServers(v) => v.encode(buf),
             Self::DomainNameServers(v) => v.encode(buf),
+            Self::BroadcastAddress(v) => v.encode(buf),
+            Self::RequestedIpAddress(v) => v.encode(buf),
+            Self::IpAddressLeaseTime(v) => v.encode(buf),
+            Self::DhcpMessageType(v) => v.encode(buf),
+            Self::ServerIdentifier(v) => v.encode(buf),
+            Self::ParameterRequestList(v) => v.encode(buf),
+            Self::RenewalTimeValue(v) => v.encode(buf),
+            Self::RebindingTimeValue(v) => v.encode(buf),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct SubnetMask(u32);
+pub struct SubnetMask(Ipv4Addr);
 
 impl Encode for SubnetMask {
     fn encode<B>(&self, buf: B)
@@ -222,7 +599,7 @@ impl Decode for SubnetMask {
     where
         B: Buf,
     {
-        u32::decode(buf).map(Self)
+        Ipv4Addr::decode(buf).map(Self)
     }
 }
 
@@ -306,12 +683,14 @@ impl Decode for DhcpMessageType {
     }
 }
 
+#[derive(Clone, Debug)]
 enum Error {
     InvaidOp(u8),
     InvalidDhcpMessageType(u8),
     UnexpectedEof,
     NotTerminated,
     InvalidOption(u8),
+    InvalidMagic([u8; 4]),
 }
 
 trait Decode: Sized {
@@ -378,6 +757,7 @@ impl Decode for Ipv4Addr {
 }
 
 // https://datatracker.ietf.org/doc/html/rfc1533#section-9.1
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RequestedIpAddress(Ipv4Addr);
 
 impl Encode for RequestedIpAddress {
@@ -406,6 +786,40 @@ impl Decode for RequestedIpAddress {
 // https://datatracker.ietf.org/doc/html/rfc1533#section-9.6
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ParameterRequestList(Vec<OptionCode>);
+
+impl Encode for ParameterRequestList {
+    fn encode<B>(&self, mut buf: B)
+    where
+        B: BufMut,
+    {
+        let len = self.0.len() as u8;
+        len.encode(&mut buf);
+
+        for code in &self.0 {
+            code.to_u8().encode(&mut buf);
+        }
+    }
+}
+
+impl Decode for ParameterRequestList {
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        let len = u8::decode(&mut buf)?;
+
+        let mut codes = Vec::new();
+        for _ in 0..len {
+            let code = u8::decode(&mut buf)?;
+            // Skip all unknown codes.
+            if let Ok(code) = OptionCode::from_u8(code) {
+                codes.push(code);
+            }
+        }
+
+        Ok(Self(codes))
+    }
+}
 
 impl Encode for u8 {
     fn encode<B>(&self, mut buf: B)
@@ -783,5 +1197,92 @@ impl Decode for OptionCode {
         B: Buf,
     {
         Self::from_u8(u8::decode(buf)?)
+    }
+}
+
+/// A physical IEEE802 link-layer address.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MacAddr {
+    octets: [u8; 6],
+}
+
+impl MacAddr {
+    pub fn from_octets(octets: [u8; 6]) -> Self {
+        Self { octets }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct IpAddressLeaseTime(u32);
+
+impl Encode for IpAddressLeaseTime {
+    fn encode<B>(&self, mut buf: B)
+    where
+        B: BufMut,
+    {
+        let len: u8 = 4;
+
+        len.encode(&mut buf);
+        self.0.encode(&mut buf);
+    }
+}
+
+impl Decode for IpAddressLeaseTime {
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        let _len = u8::decode(&mut buf)?;
+        u32::decode(buf).map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RenewalTimeValue(u32);
+
+impl Encode for RenewalTimeValue {
+    fn encode<B>(&self, mut buf: B)
+    where
+        B: BufMut,
+    {
+        let len: u8 = 4;
+
+        len.encode(&mut buf);
+        self.0.encode(&mut buf);
+    }
+}
+
+impl Decode for RenewalTimeValue {
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        let _len = u8::decode(&mut buf)?;
+        u32::decode(buf).map(Self)
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct RebindingTimeValue(u32);
+
+impl Encode for RebindingTimeValue {
+    fn encode<B>(&self, mut buf: B)
+    where
+        B: BufMut,
+    {
+        let len: u8 = 4;
+
+        len.encode(&mut buf);
+        self.0.encode(&mut buf);
+    }
+}
+
+impl Decode for RebindingTimeValue {
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
+    where
+        B: Buf,
+    {
+        let _len = u8::decode(&mut buf)?;
+        u32::decode(buf).map(Self)
     }
 }
