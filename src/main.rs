@@ -1,3 +1,5 @@
+mod ioctl;
+
 use std::collections::{HashMap, HashSet};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -23,20 +25,26 @@ pub struct Config {
 
 #[tokio::main]
 async fn main() {
+    dbg!(std::env::vars());
+    std::env::set_var("RUST_LOG", "trace");
+    std::env::set_var("RUST_BACKTRACE", "full");
     pretty_env_logger::init();
 
     let mut state = State {
         pool: Pool::new(HashMap::new()),
         config: Config {
-            local_addr: Ipv4Addr::new(0, 0, 0, 0),
-            routers: vec![],
-            dns: vec![],
+            local_addr: Ipv4Addr::new(192, 168, 122, 1),
+            routers: vec![Ipv4Addr::new(192, 168, 122, 1)],
+            dns: vec![Ipv4Addr::new(192, 168, 122, 1)],
             broadcast: Ipv4Addr::BROADCAST,
             subnet: Ipv4Addr::new(255, 255, 255, 0),
         },
     };
 
     let socket = UdpSocket::bind("0.0.0.0:67").await.unwrap();
+
+    let sock_ref = socket2::SockRef::from(&socket);
+    sock_ref.set_broadcast(true).unwrap();
 
     loop {
         let mut buf = vec![0; 1500];
@@ -88,12 +96,7 @@ async fn handle_packet(state: &mut State, socket: &UdpSocket, addr: SocketAddr, 
     }
 }
 
-async fn handle_discover(
-    state: &mut State,
-    socket: &UdpSocket,
-    mut addr: SocketAddr,
-    packet: Packet,
-) {
+async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr, packet: Packet) {
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
         tracing::debug!("client has not requested any paramters");
         return;
@@ -192,16 +195,14 @@ async fn handle_discover(
     let mut buf = Vec::new();
     resp.encode(&mut buf);
 
-    addr.set_ip(IpAddr::V4(ip));
-    socket.send_to(&buf, addr).await.unwrap();
+    tracing::info!("offering {:?} to {:?}", ip, mac);
+
+    ioctl::arp_set(&socket, ip, mac).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 122, 255)), addr.port());
+    socket.send_to(&buf, dst).await.unwrap();
 }
 
-async fn handle_request(
-    state: &mut State,
-    socket: &UdpSocket,
-    mut addr: SocketAddr,
-    packet: Packet,
-) {
+async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr, packet: Packet) {
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
         tracing::debug!("client has not requested any paramters");
         return;
@@ -305,8 +306,9 @@ async fn handle_request(
     let mut buf = Vec::new();
     resp.encode(&mut buf);
 
-    addr.set_ip(IpAddr::V4(ip));
-    socket.send_to(&buf, addr).await.unwrap();
+    ioctl::arp_set(&socket, ip, mac).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 122, 255)), addr.port());
+    socket.send_to(&buf, dst).await.unwrap();
 }
 
 #[derive(Clone, Debug)]
@@ -356,6 +358,8 @@ impl Encode for Packet {
         for (_, option) in &self.options {
             option.encode(&mut buf);
         }
+
+        OptionCode::End.encode(&mut buf);
     }
 }
 
@@ -408,7 +412,20 @@ impl Decode for Packet {
                 Ok(OptionCode::DomainNameServer) => {
                     DhcpOption::DomainNameServers(DomainNameServers::decode(&mut buf)?)
                 }
-                _ => return Err(Error::InvalidOption(code)),
+                Ok(OptionCode::DhcpMessageType) => {
+                    DhcpOption::DhcpMessageType(DhcpMessageType::decode(&mut buf)?)
+                }
+                Ok(OptionCode::ParameterRequestList) => {
+                    DhcpOption::ParameterRequestList(ParameterRequestList::decode(&mut buf)?)
+                }
+                _ => {
+                    let len = u8::decode(&mut buf)?;
+                    for _ in 0..len {
+                        u8::decode(&mut buf)?;
+                    }
+
+                    continue;
+                }
             };
 
             let code = OptionCode::from_u8(code).unwrap();
@@ -513,7 +530,7 @@ impl Pool {
     }
 
     fn generate_ip(&mut self) -> Option<Ipv4Addr> {
-        todo!()
+        Some(Ipv4Addr::new(192, 168, 122, 10))
     }
 
     fn is_valid_ip(&self, ip: Ipv4Addr) -> bool {
@@ -586,19 +603,22 @@ impl Encode for DhcpOption {
 pub struct SubnetMask(Ipv4Addr);
 
 impl Encode for SubnetMask {
-    fn encode<B>(&self, buf: B)
+    fn encode<B>(&self, mut buf: B)
     where
         B: BufMut,
     {
+        let len: u8 = 4;
+        len.encode(&mut buf);
         self.0.encode(buf);
     }
 }
 
 impl Decode for SubnetMask {
-    fn decode<B>(buf: B) -> Result<Self, Error>
+    fn decode<B>(mut buf: B) -> Result<Self, Error>
     where
         B: Buf,
     {
+        let _len = u8::decode(&mut buf)?;
         Ipv4Addr::decode(buf).map(Self)
     }
 }
@@ -667,8 +687,8 @@ impl Decode for DhcpMessageType {
     where
         B: Buf,
     {
-        let len = buf.get_u8();
-        let typ = buf.get_u8();
+        let len = u8::decode(&mut buf)?;
+        let typ = u8::decode(&mut buf)?;
 
         match typ {
             1 => Ok(Self::Discover),
@@ -726,7 +746,7 @@ impl Decode for ServerIdentifier {
     where
         B: Buf,
     {
-        let len = buf.get_u8();
+        let len = u8::decode(&mut buf)?;
         let addr = Ipv4Addr::decode(buf)?;
         Ok(Self(addr))
     }
@@ -747,10 +767,10 @@ impl Decode for Ipv4Addr {
     where
         B: Buf,
     {
-        let a0 = buf.get_u8();
-        let a1 = buf.get_u8();
-        let a2 = buf.get_u8();
-        let a3 = buf.get_u8();
+        let a0 = u8::decode(&mut buf)?;
+        let a1 = u8::decode(&mut buf)?;
+        let a2 = u8::decode(&mut buf)?;
+        let a3 = u8::decode(&mut buf)?;
 
         Ok(Self::new(a0, a1, a2, a3))
     }
@@ -777,7 +797,7 @@ impl Decode for RequestedIpAddress {
     where
         B: Buf,
     {
-        let len = buf.get_u8();
+        let len = u8::decode(&mut buf)?;
         let addr = Ipv4Addr::decode(buf)?;
         Ok(Self(addr))
     }
@@ -1209,6 +1229,10 @@ pub struct MacAddr {
 impl MacAddr {
     pub fn from_octets(octets: [u8; 6]) -> Self {
         Self { octets }
+    }
+
+    pub fn octets(&self) -> [u8; 6] {
+        self.octets
     }
 }
 
