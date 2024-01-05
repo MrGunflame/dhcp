@@ -1,11 +1,14 @@
+mod database;
 mod ioctl;
 mod pool;
 
 use std::collections::HashMap;
+use std::fmt::{self, Debug, Formatter};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::{Buf, BufMut};
+use database::Database;
 use pool::Pool;
 use tokio::net::UdpSocket;
 
@@ -14,6 +17,7 @@ const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 pub struct State {
     pool: Pool,
     config: Config,
+    database: Database,
 }
 
 #[derive(Clone, Debug)]
@@ -27,13 +31,19 @@ pub struct Config {
 
 #[tokio::main]
 async fn main() {
-    dbg!(std::env::vars());
     std::env::set_var("RUST_LOG", "trace");
-    std::env::set_var("RUST_BACKTRACE", "full");
     pretty_env_logger::init();
 
+    let mut database = Database::new("./leases").await.unwrap();
+    let entries = database.iter().await.unwrap();
+
+    let mut leases = HashMap::new();
+    for (mac, ip) in entries {
+        leases.insert(mac, ip);
+    }
+
     let mut state = State {
-        pool: Pool::new(HashMap::new()),
+        pool: Pool::new(leases),
         config: Config {
             local_addr: Ipv4Addr::new(192, 168, 122, 1),
             routers: vec![Ipv4Addr::new(192, 168, 122, 1)],
@@ -41,6 +51,7 @@ async fn main() {
             broadcast: Ipv4Addr::BROADCAST,
             subnet: Ipv4Addr::new(255, 255, 255, 0),
         },
+        database,
     };
 
     let socket = UdpSocket::bind("0.0.0.0:67").await.unwrap();
@@ -123,6 +134,7 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
     let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
 
     let ip = state.pool.request_addr(mac, requested_ip).unwrap();
+    state.database.insert(mac, ip).await.unwrap();
 
     let mut options = HashMap::new();
     options.insert(
@@ -228,12 +240,25 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
 
     let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
 
-    let ip = if packet.siaddr.is_unspecified() {
-        state.pool.request_addr(mac, requested_ip).unwrap()
+    let ip = if let Some(ip) = state.pool.get(mac) {
+        // We already have an IP registered for the MAC and reassign it.
+        ip
+    } else if packet.siaddr.is_unspecified() {
+        match state.pool.request_addr(mac, requested_ip) {
+            Some(ip) => ip,
+            None => {
+                tracing::error!(
+                    "cannot satisfy request from {:?}, out of free addresses",
+                    mac
+                );
+                return;
+            }
+        }
     } else {
         // Client already has an address and wants to renew.
         packet.siaddr
     };
+    state.database.insert(mac, ip).await.unwrap();
 
     let mut options = HashMap::new();
     options.insert(
@@ -414,8 +439,14 @@ impl Decode for Packet {
                 Ok(OptionCode::DomainNameServer) => {
                     DhcpOption::DomainNameServers(DomainNameServers::decode(&mut buf)?)
                 }
+                Ok(OptionCode::RequestedIpAddress) => {
+                    DhcpOption::RequestedIpAddress(RequestedIpAddress::decode(&mut buf)?)
+                }
                 Ok(OptionCode::DhcpMessageType) => {
                     DhcpOption::DhcpMessageType(DhcpMessageType::decode(&mut buf)?)
+                }
+                Ok(OptionCode::ServerIdentifier) => {
+                    DhcpOption::ServerIdentifier(ServerIdentifier::decode(&mut buf)?)
                 }
                 Ok(OptionCode::ParameterRequestList) => {
                     DhcpOption::ParameterRequestList(ParameterRequestList::decode(&mut buf)?)
@@ -1170,7 +1201,7 @@ impl Decode for OptionCode {
 }
 
 /// A physical IEEE802 link-layer address.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
 pub struct MacAddr {
     octets: [u8; 6],
 }
@@ -1182,6 +1213,21 @@ impl MacAddr {
 
     pub fn octets(&self) -> [u8; 6] {
         self.octets
+    }
+}
+
+impl Debug for MacAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
+            self.octets[0],
+            self.octets[1],
+            self.octets[2],
+            self.octets[3],
+            self.octets[4],
+            self.octets[5],
+        )
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
 use crate::{MacAddr, Op};
@@ -6,54 +6,42 @@ use crate::{MacAddr, Op};
 #[derive(Clone, Debug)]
 pub struct Pool {
     leases: HashMap<MacAddr, Ipv4Addr>,
-    addrs: HashSet<Ipv4Addr>,
+    allocator: Allocator,
 }
 
 impl Pool {
     pub fn new(leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
+        let mut allocator = Allocator::new(Ipv4Range {
+            start: Ipv4Addr::new(192, 168, 122, 2),
+            end: Ipv4Addr::new(192, 168, 122, 254),
+        });
+
         let mut addrs = HashSet::with_capacity(leases.len());
         for addr in leases.values() {
             addrs.insert(*addr);
+
+            // Allocate all addresses that are still in use.
+            let ip = allocator.request(Some(*addr));
+            debug_assert_eq!(ip, Some(*addr));
         }
 
-        Self { leases, addrs }
+        Self { leases, allocator }
     }
 
     pub fn request_addr(&mut self, mac: MacAddr, ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-        if let Some(ip) = ip {
-            if !self.addrs.contains(&ip) && self.is_valid_ip(ip) {
-                self.leases.insert(mac, ip);
-                self.addrs.insert(ip);
-
-                return Some(ip);
-            }
-        }
-
-        let ip = self.generate_ip()?;
+        let ip = self.allocator.request(ip)?;
         self.leases.insert(mac, ip);
         Some(ip)
     }
 
-    pub fn mac_has_ip(&self, mac: MacAddr, ip: Ipv4Addr) -> bool {
-        if let Some(addr) = self.leases.get(&mac) {
-            *addr == ip
-        } else {
-            false
-        }
+    pub fn get(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+        self.leases.get(&mac).copied()
     }
 
     pub fn release_addr(&mut self, mac: MacAddr) {
         if let Some(ip) = self.leases.remove(&mac) {
-            self.addrs.remove(&ip);
+            self.allocator.release(ip);
         }
-    }
-
-    fn generate_ip(&mut self) -> Option<Ipv4Addr> {
-        Some(Ipv4Addr::new(192, 168, 122, 10))
-    }
-
-    fn is_valid_ip(&self, ip: Ipv4Addr) -> bool {
-        true
     }
 }
 
