@@ -1,10 +1,12 @@
 mod ioctl;
+mod pool;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::{Buf, BufMut};
+use pool::Pool;
 use tokio::net::UdpSocket;
 
 const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
@@ -482,59 +484,6 @@ impl Decode for Op {
             0x02 => Ok(Self::BootReply),
             b => Err(Error::InvaidOp(b)),
         }
-    }
-}
-
-pub struct Pool {
-    leases: HashMap<MacAddr, Ipv4Addr>,
-    addrs: HashSet<Ipv4Addr>,
-}
-
-impl Pool {
-    pub fn new(leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
-        let mut addrs = HashSet::with_capacity(leases.len());
-        for addr in leases.values() {
-            addrs.insert(*addr);
-        }
-
-        Self { leases, addrs }
-    }
-
-    pub fn request_addr(&mut self, mac: MacAddr, ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
-        if let Some(ip) = ip {
-            if !self.addrs.contains(&ip) && self.is_valid_ip(ip) {
-                self.leases.insert(mac, ip);
-                self.addrs.insert(ip);
-
-                return Some(ip);
-            }
-        }
-
-        let ip = self.generate_ip()?;
-        self.leases.insert(mac, ip);
-        Some(ip)
-    }
-
-    pub fn mac_has_ip(&self, mac: MacAddr, ip: Ipv4Addr) -> bool {
-        if let Some(addr) = self.leases.get(&mac) {
-            *addr == ip
-        } else {
-            false
-        }
-    }
-
-    pub fn release_addr(&mut self, mac: MacAddr) {
-        if let Some(ip) = self.leases.remove(&mac) {
-            self.addrs.remove(&ip);
-        }
-    }
-
-    fn generate_ip(&mut self) -> Option<Ipv4Addr> {
-        Some(Ipv4Addr::new(192, 168, 122, 10))
-    }
-
-    fn is_valid_ip(&self, ip: Ipv4Addr) -> bool {
-        true
     }
 }
 
