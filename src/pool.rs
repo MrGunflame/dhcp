@@ -69,7 +69,7 @@ impl Allocator {
         Self {
             blocks: vec![Block {
                 start: range.start,
-                len: range.len(),
+                len: range.len() + 1,
             }],
             range,
         }
@@ -78,8 +78,6 @@ impl Allocator {
     pub fn request(&mut self, ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
         if let Some(ip) = ip {
             for (index, block) in self.blocks.iter_mut().enumerate() {
-                // Ip is in this block.
-                dbg!(block.contains(ip));
                 if block.contains(ip) {
                     // Block only contains one address. Claim the address
                     // and remove the block.
@@ -104,7 +102,6 @@ impl Allocator {
 
                     // Address is the middle of the block.
                     // Split the block at the address we want to allocate.
-                    dbg!(&block);
                     let (lhs, mut rhs) = block.split_at(ip);
                     *block = lhs;
                     rhs.bump();
@@ -129,15 +126,7 @@ impl Allocator {
         }
     }
 
-    pub fn release(&mut self, ip: Ipv4Addr) {
-        // Released ip the previously allocated ip. We move the cursor back once and
-        // can reuse ip.
-        // if u32::from_be_bytes(ip.octets()).wrapping_sub(1) == u32::from_le_bytes(self.next.octets())
-        // {
-        //     // self.next = ip;
-        //     return;
-        // }
-    }
+    pub fn release(&mut self, ip: Ipv4Addr) {}
 }
 
 #[derive(Clone, Debug)]
@@ -178,7 +167,7 @@ impl Block {
         let start = self.start.to_bits_();
         let end = self.start.to_bits_() + self.len;
         let addr = addr.to_bits_();
-        addr >= start && addr < end
+        addr >= start && addr <= end
     }
 
     fn end_inclusive(&self) -> Ipv4Addr {
@@ -187,7 +176,6 @@ impl Block {
 
     fn split_at(&self, addr: Ipv4Addr) -> (Block, Block) {
         debug_assert!(self.contains(addr));
-        dbg!(self.contains(addr), addr);
 
         let index = addr.to_bits_() - self.start.to_bits_();
         (
@@ -197,7 +185,7 @@ impl Block {
             },
             Block {
                 start: Ipv4Addr::from_bits_(self.start.to_bits_() + index),
-                len: self.len - index - 1,
+                len: self.len - index,
             },
         )
     }
@@ -232,7 +220,7 @@ mod tests {
             end: Ipv4Addr::new(10, 0, 0, 255),
         });
 
-        for index in 0..255 {
+        for index in 0..=255 {
             assert_eq!(
                 allocator.request(None),
                 Some(Ipv4Addr::new(10, 0, 0, index))
@@ -254,6 +242,7 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 20),
             Ipv4Addr::new(10, 0, 0, 170),
             Ipv4Addr::new(10, 0, 0, 0),
+            Ipv4Addr::new(10, 0, 0, 255),
         ];
 
         for addr in addrs {
