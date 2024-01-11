@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
 
-use crate::{MacAddr, Op};
+use crate::MacAddr;
 
 #[derive(Clone, Debug)]
 pub struct Pool {

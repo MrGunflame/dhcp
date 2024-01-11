@@ -1,3 +1,4 @@
+mod config;
 mod database;
 mod ioctl;
 mod pool;
@@ -8,6 +9,7 @@ use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use bytes::{Buf, BufMut};
+use config::Config;
 use database::Database;
 use pool::Pool;
 use tokio::net::UdpSocket;
@@ -20,18 +22,16 @@ pub struct State {
     database: Database,
 }
 
-#[derive(Clone, Debug)]
-pub struct Config {
-    local_addr: Ipv4Addr,
-    routers: Vec<Ipv4Addr>,
-    dns: Vec<Ipv4Addr>,
-    broadcast: Ipv4Addr,
-    subnet: Ipv4Addr,
-}
-
 #[tokio::main]
 async fn main() {
-    std::env::set_var("RUST_LOG", "trace");
+    let config = match Config::from_file("config.toml") {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("failed to read config: {}", err);
+            return;
+        }
+    };
+
     pretty_env_logger::init();
 
     let mut database = Database::new("./leases").await.unwrap();
@@ -44,13 +44,7 @@ async fn main() {
 
     let mut state = State {
         pool: Pool::new(leases),
-        config: Config {
-            local_addr: Ipv4Addr::new(192, 168, 122, 1),
-            routers: vec![Ipv4Addr::new(192, 168, 122, 1)],
-            dns: vec![Ipv4Addr::new(192, 168, 122, 1)],
-            broadcast: Ipv4Addr::BROADCAST,
-            subnet: Ipv4Addr::new(255, 255, 255, 0),
-        },
+        config,
         database,
     };
 
@@ -623,7 +617,7 @@ impl Decode for TimeOffset {
     where
         B: Buf,
     {
-        let len = u8::decode(&mut buf)?;
+        let _len = u8::decode(&mut buf)?;
         u32::decode(buf).map(Self)
     }
 }
@@ -667,7 +661,7 @@ impl Decode for DhcpMessageType {
     where
         B: Buf,
     {
-        let len = u8::decode(&mut buf)?;
+        let _len = u8::decode(&mut buf)?;
         let typ = u8::decode(&mut buf)?;
 
         match typ {
@@ -726,7 +720,7 @@ impl Decode for ServerIdentifier {
     where
         B: Buf,
     {
-        let len = u8::decode(&mut buf)?;
+        let _len = u8::decode(&mut buf)?;
         let addr = Ipv4Addr::decode(buf)?;
         Ok(Self(addr))
     }
@@ -777,7 +771,7 @@ impl Decode for RequestedIpAddress {
     where
         B: Buf,
     {
-        let len = u8::decode(&mut buf)?;
+        let _len = u8::decode(&mut buf)?;
         let addr = Ipv4Addr::decode(buf)?;
         Ok(Self(addr))
     }
@@ -971,7 +965,7 @@ impl Decode for BroadcastAddress {
     where
         B: Buf,
     {
-        let len = u8::decode(&mut buf)?;
+        let _len = u8::decode(&mut buf)?;
         Ipv4Addr::decode(buf).map(Self)
     }
 }
