@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::task::Poll;
 use std::time::SystemTime;
 
 use bytes::{Buf, BufMut};
@@ -35,9 +36,62 @@ impl Lease {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct TimeWheel {
+    leases: Vec<Lease>,
+}
+
+impl TimeWheel {
+    pub fn new() -> Self {
+        Self { leases: Vec::new() }
+    }
+
+    pub fn insert(&mut self, lease: Lease) {
+        let mut index = 0;
+        while index < self.leases.len() {
+            // Lease expires before the lease at index and takes
+            // the place.
+            if lease.valid_until < self.leases[index].valid_until {
+                self.leases.insert(index, lease);
+                return;
+            }
+
+            index += 1;
+        }
+
+        self.leases.push(lease);
+    }
+
+    pub fn remove(&mut self, mac: MacAddr) {
+        self.leases.retain(|lease| lease.mac != mac);
+    }
+
+    /// Sleep until the first lease in the wheel expires.
+    ///
+    /// Never yields if no lease are in the wheel.
+    pub async fn wait(&mut self) -> Lease {
+        let Some(lease) = self.leases.first() else {
+            // This will never yield but this is ok since we expect the executor
+            // always drop and recreate the future when a new lease is created.
+            futures::future::poll_fn(|_| Poll::<()>::Pending).await;
+            unreachable!();
+        };
+
+        // If the duration is "negative" this returns an error. This can only
+        // happen if the lease just expired and we don't have to go to sleep.
+        let Ok(duration) = lease.valid_until.duration_since(SystemTime::now()) else {
+            return self.leases.remove(0);
+        };
+
+        tokio::time::sleep(duration).await;
+        self.leases.remove(0)
+    }
+}
+
 pub struct MainPool {
     pool: Pool,
     database: Database,
+    wheel: TimeWheel,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,6 +115,7 @@ impl MainPool {
         };
 
         self.database.insert(lease).await?;
+        self.wheel.insert(lease);
         Ok(Some(lease))
     }
 
@@ -68,8 +123,26 @@ impl MainPool {
         self.pool.get(mac)
     }
 
-    pub fn extend(&mut self, mac: MacAddr) {
+    pub async fn extend(&mut self, mac: MacAddr) -> Result<Option<Lease>, ServerError> {
         self.pool.extend(mac);
+        if let Some(lease) = self.pool.get(mac) {
+            self.database.insert(lease).await?;
+
+            // Reset the wheel entry.
+            self.wheel.remove(mac);
+            self.wheel.insert(lease);
+            Ok(Some(lease))
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn wait_for_expired_lease(&mut self) -> Result<(), ServerError> {
+        loop {
+            let lease = self.wheel.wait().await;
+            self.pool.release_addr(lease.mac);
+            self.database.remove(lease.mac).await?;
+        }
     }
 }
 
@@ -85,17 +158,20 @@ async fn main() {
 
     pretty_env_logger::init();
 
-    let mut database = Database::new("./leases").await.unwrap();
+    let database = Database::new("./leases").await.unwrap();
 
     let mut leases = HashMap::new();
+    let mut wheel = TimeWheel::new();
     for lease in database.leases() {
         leases.insert(lease.mac, lease);
+        wheel.insert(lease);
     }
 
     let mut state = State {
         pool: MainPool {
             pool: Pool::new(config.start, config.end, leases),
             database,
+            wheel,
         },
         config,
     };
@@ -107,7 +183,20 @@ async fn main() {
 
     loop {
         let mut buf = vec![0; 1500];
-        let (len, addr) = socket.recv_from(&mut buf).await.unwrap();
+
+        let (len, addr) = tokio::select! {
+            res = socket.recv_from(&mut buf) => match res {
+                Ok((len, addr)) => (len, addr),
+                Err(err) => {
+                    tracing::error!("failed to receive data on socket: {}", err);
+                    continue;
+                }
+            },
+            // The future will never yield if no leases are stored so we need
+            // drop the future if the other completes.
+            _ = state.pool.wait_for_expired_lease() => continue,
+        };
+
         buf.truncate(len);
         tracing::info!("got packet from {:?}", addr);
 
@@ -181,9 +270,7 @@ async fn allocate_lease_for_client(
                 );
             }
 
-            state.pool.extend(mac);
-
-            let lease = state.pool.get(mac).unwrap();
+            let lease = state.pool.extend(mac).await?.unwrap();
             return Ok(Some(lease));
         }
 
@@ -213,7 +300,10 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
             tracing::error!("cannot offer lease, out of addresses");
             return;
         }
-        Err(err) => return,
+        Err(err) => {
+            tracing::error!("server error: {}", err);
+            return;
+        }
     };
 
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
@@ -313,7 +403,10 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
             tracing::error!("cannot offer lease, out of addresses");
             return;
         }
-        Err(err) => return,
+        Err(err) => {
+            tracing::error!("server error: {}", err);
+            return;
+        }
     };
 
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
@@ -1375,5 +1468,47 @@ impl Decode for RebindingTimeValue {
     {
         let _len = u8::decode(&mut buf)?;
         u32::decode(buf).map(Self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::time::{Duration, SystemTime};
+
+    use crate::{Lease, MacAddr, TimeWheel};
+
+    #[test]
+    fn time_wheel_insert() {
+        let mut wheel = TimeWheel::new();
+
+        let lease0 = create_lease(0);
+        std::thread::sleep(Duration::from_millis(100));
+        let lease1 = create_lease(1);
+        std::thread::sleep(Duration::from_millis(100));
+        let lease2 = create_lease(2);
+
+        wheel.insert(lease1);
+        assert_eq!(wheel.leases.len(), 1);
+        assert_eq!(wheel.leases[0].mac, MacAddr::from_octets([1; 6]));
+
+        wheel.insert(lease2);
+        assert_eq!(wheel.leases.len(), 2);
+        assert_eq!(wheel.leases[0].mac, MacAddr::from_octets([1; 6]));
+        assert_eq!(wheel.leases[1].mac, MacAddr::from_octets([2; 6]));
+
+        wheel.insert(lease0);
+        assert_eq!(wheel.leases.len(), 3);
+        assert_eq!(wheel.leases[0].mac, MacAddr::from_octets([0; 6]));
+        assert_eq!(wheel.leases[1].mac, MacAddr::from_octets([1; 6]));
+        assert_eq!(wheel.leases[2].mac, MacAddr::from_octets([2; 6]));
+    }
+
+    fn create_lease(mac: u8) -> Lease {
+        Lease {
+            mac: MacAddr::from_octets([mac; 6]),
+            ip: Ipv4Addr::UNSPECIFIED,
+            valid_until: SystemTime::now(),
+        }
     }
 }
