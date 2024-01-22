@@ -11,17 +11,15 @@ use std::time::SystemTime;
 
 use bytes::{Buf, BufMut};
 use config::Config;
-use database::Database;
-use libc::rtentry;
+use database::{Database, DecodeError};
 use pool::Pool;
 use tokio::net::UdpSocket;
 
 const DHCP_MAGIC: [u8; 4] = [99, 130, 83, 99];
 
 pub struct State {
-    pool: Pool,
+    pool: MainPool,
     config: Config,
-    database: Database,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -34,6 +32,44 @@ pub struct Lease {
 impl Lease {
     pub fn is_valid(&self) -> bool {
         false
+    }
+}
+
+pub struct MainPool {
+    pool: Pool,
+    database: Database,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("client error")]
+    ClientError,
+    #[error("decode: {0}")]
+    Decode(#[from] DecodeError),
+}
+
+impl MainPool {
+    pub async fn request_addr(
+        &mut self,
+        mac: MacAddr,
+        ip: Option<Ipv4Addr>,
+    ) -> Result<Option<Lease>, ServerError> {
+        let Some(lease) = self.pool.request_addr(mac, ip) else {
+            return Ok(None);
+        };
+
+        self.database.insert(lease).await?;
+        Ok(Some(lease))
+    }
+
+    pub fn get(&self, mac: MacAddr) -> Option<Lease> {
+        self.pool.get(mac)
+    }
+
+    pub fn extend(&mut self, mac: MacAddr) {
+        self.pool.extend(mac);
     }
 }
 
@@ -50,17 +86,18 @@ async fn main() {
     pretty_env_logger::init();
 
     let mut database = Database::new("./leases").await.unwrap();
-    let entries = database.iter().await.unwrap();
 
     let mut leases = HashMap::new();
-    for lease in entries {
+    for lease in database.leases() {
         leases.insert(lease.mac, lease);
     }
 
     let mut state = State {
-        pool: Pool::new(config.start, config.end, leases),
+        pool: MainPool {
+            pool: Pool::new(config.start, config.end, leases),
+            database,
+        },
         config,
-        database,
     };
 
     let socket = UdpSocket::bind("0.0.0.0:67").await.unwrap();
@@ -122,7 +159,7 @@ async fn handle_packet(state: &mut State, socket: &UdpSocket, addr: SocketAddr, 
 async fn allocate_lease_for_client(
     state: &mut State,
     packet: &Packet,
-) -> Result<Option<Lease>, ()> {
+) -> Result<Option<Lease>, ServerError> {
     // Chose an IP address for the client with priorities based on
     // https://datatracker.ietf.org/doc/html/rfc2131#section-4.3.1:
     // 1. The clients current "client address" (ciaddr) if the lease is valid.
@@ -145,7 +182,6 @@ async fn allocate_lease_for_client(
             }
 
             state.pool.extend(mac);
-            state.database.insert(lease).await.unwrap();
 
             let lease = state.pool.get(mac).unwrap();
             return Ok(Some(lease));
@@ -153,9 +189,7 @@ async fn allocate_lease_for_client(
 
         // Client lease is expired but we attempt to allocate the requested client
         // address of the client if it is available.
-        if let Some(lease) = state.pool.request_addr(mac, Some(packet.ciaddr)) {
-            state.database.insert(lease).await.unwrap();
-
+        if let Some(lease) = state.pool.request_addr(mac, Some(packet.ciaddr)).await? {
             return Ok(Some(lease));
         }
     }
@@ -163,12 +197,12 @@ async fn allocate_lease_for_client(
     let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
         Some(opt) => match opt {
             DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
-            _ => return Err(()),
+            _ => return Err(ServerError::ClientError),
         },
         None => None,
     };
 
-    let lease = state.pool.request_addr(mac, requested_ip);
+    let lease = state.pool.request_addr(mac, requested_ip).await?;
     Ok(lease)
 }
 
@@ -179,7 +213,7 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
             tracing::error!("cannot offer lease, out of addresses");
             return;
         }
-        Err(()) => return,
+        Err(err) => return,
     };
 
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
@@ -279,7 +313,7 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
             tracing::error!("cannot offer lease, out of addresses");
             return;
         }
-        Err(()) => return,
+        Err(err) => return,
     };
 
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
