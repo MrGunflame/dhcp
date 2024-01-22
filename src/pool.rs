@@ -1,46 +1,59 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
+use std::time::{Duration, SystemTime};
 
-use crate::MacAddr;
+use crate::{Lease, MacAddr};
 
+/// A pool of DHCP leases.
 #[derive(Clone, Debug)]
 pub struct Pool {
-    leases: HashMap<MacAddr, Ipv4Addr>,
+    leases: HashMap<MacAddr, Lease>,
     allocator: Allocator,
+    lifetime: Duration,
 }
 
 impl Pool {
-    pub fn new(leases: HashMap<MacAddr, Ipv4Addr>) -> Self {
-        let mut allocator = Allocator::new(Ipv4Range {
-            start: Ipv4Addr::new(192, 168, 122, 2),
-            end: Ipv4Addr::new(192, 168, 122, 254),
-        });
+    pub fn new(start: Ipv4Addr, end: Ipv4Addr, leases: HashMap<MacAddr, Lease>) -> Self {
+        let mut allocator = Allocator::new(Ipv4Range { start, end });
 
-        let mut addrs = HashSet::with_capacity(leases.len());
-        for addr in leases.values() {
-            addrs.insert(*addr);
-
+        for lease in leases.values() {
             // Allocate all addresses that are still in use.
-            let ip = allocator.request(Some(*addr));
-            debug_assert_eq!(ip, Some(*addr));
+            let ip = allocator.request(Some(lease.ip));
+            debug_assert_eq!(ip, Some(lease.ip));
         }
 
-        Self { leases, allocator }
+        Self {
+            leases,
+            allocator,
+            lifetime: Duration::from_secs(60 * 60),
+        }
     }
 
-    pub fn request_addr(&mut self, mac: MacAddr, ip: Option<Ipv4Addr>) -> Option<Ipv4Addr> {
+    pub fn request_addr(&mut self, mac: MacAddr, ip: Option<Ipv4Addr>) -> Option<Lease> {
         let ip = self.allocator.request(ip)?;
-        self.leases.insert(mac, ip);
-        Some(ip)
+
+        let lease = Lease {
+            mac,
+            ip,
+            valid_until: SystemTime::now() + self.lifetime,
+        };
+        self.leases.insert(mac, lease);
+        Some(lease)
     }
 
-    pub fn get(&self, mac: MacAddr) -> Option<Ipv4Addr> {
+    pub fn get(&self, mac: MacAddr) -> Option<Lease> {
         self.leases.get(&mac).copied()
     }
 
+    pub fn extend(&mut self, mac: MacAddr) {
+        if let Some(lease) = self.leases.get_mut(&mac) {
+            lease.valid_until = SystemTime::now() + self.lifetime;
+        }
+    }
+
     pub fn release_addr(&mut self, mac: MacAddr) {
-        if let Some(ip) = self.leases.remove(&mac) {
-            self.allocator.release(ip);
+        if let Some(lease) = self.leases.remove(&mac) {
+            self.allocator.release(lease.ip);
         }
     }
 }

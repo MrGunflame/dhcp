@@ -1,12 +1,13 @@
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use bytes::Buf;
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::MacAddr;
+use crate::{Lease, MacAddr};
 
 #[derive(Debug)]
 pub struct Database {
@@ -23,14 +24,22 @@ impl Database {
         Ok(Self { file })
     }
 
-    pub async fn insert(&mut self, mac: MacAddr, ip: Ipv4Addr) -> io::Result<()> {
+    pub async fn insert(&mut self, lease: Lease) -> io::Result<()> {
         let mut buf = Vec::new();
-        buf.extend(mac.octets());
-        buf.extend(ip.octets());
+        buf.extend(lease.mac.octets());
+        buf.extend(lease.ip.octets());
+        buf.extend(
+            lease
+                .valid_until
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                .to_le_bytes(),
+        );
         self.file.write_all(&buf).await
     }
 
-    pub async fn iter(&mut self) -> io::Result<Vec<(MacAddr, Ipv4Addr)>> {
+    pub async fn iter(&mut self) -> io::Result<Vec<Lease>> {
         let mut buf = Vec::new();
         self.file.read_to_end(&mut buf).await?;
         let mut buf = &buf[..];
@@ -43,14 +52,18 @@ impl Database {
 
             let mut mac = [0; 6];
             let mut ip = [0; 4];
+            let mut valid_until = [0; 8];
 
             buf.copy_to_slice(&mut mac);
             buf.copy_to_slice(&mut ip);
+            buf.copy_to_slice(&mut valid_until);
 
-            entries.push((
-                MacAddr::from_octets(mac),
-                Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
-            ));
+            entries.push(Lease {
+                mac: MacAddr::from_octets(mac),
+                ip: Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]),
+                valid_until: SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(u64::from_le_bytes(valid_until)),
+            });
         }
 
         Ok(entries)
@@ -60,10 +73,10 @@ impl Database {
         let mut entries = self.iter().await?;
         self.file.set_len(0).await?;
 
-        entries.retain(|(m, _)| *m != mac);
+        entries.retain(|lease| lease.mac != mac);
 
-        for (mac, ip) in entries {
-            self.insert(mac, ip).await?;
+        for lease in entries {
+            self.insert(lease).await?;
         }
 
         Ok(())

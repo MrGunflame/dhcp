@@ -10,6 +10,8 @@ pub struct Config {
     pub dns: Vec<Ipv4Addr>,
     pub broadcast: Ipv4Addr,
     pub subnet: Ipv4Addr,
+    pub start: Ipv4Addr,
+    pub end: Ipv4Addr,
 }
 
 impl Config {

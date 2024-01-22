@@ -7,10 +7,12 @@ use std::collections::HashMap;
 use std::fmt::{self, Debug, Formatter};
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::SystemTime;
 
 use bytes::{Buf, BufMut};
 use config::Config;
 use database::Database;
+use libc::rtentry;
 use pool::Pool;
 use tokio::net::UdpSocket;
 
@@ -20,6 +22,19 @@ pub struct State {
     pool: Pool,
     config: Config,
     database: Database,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct Lease {
+    pub mac: MacAddr,
+    pub ip: Ipv4Addr,
+    pub valid_until: SystemTime,
+}
+
+impl Lease {
+    pub fn is_valid(&self) -> bool {
+        false
+    }
 }
 
 #[tokio::main]
@@ -38,12 +53,12 @@ async fn main() {
     let entries = database.iter().await.unwrap();
 
     let mut leases = HashMap::new();
-    for (mac, ip) in entries {
-        leases.insert(mac, ip);
+    for lease in entries {
+        leases.insert(lease.mac, lease);
     }
 
     let mut state = State {
-        pool: Pool::new(leases),
+        pool: Pool::new(config.start, config.end, leases),
         config,
         database,
     };
@@ -103,7 +118,70 @@ async fn handle_packet(state: &mut State, socket: &UdpSocket, addr: SocketAddr, 
     }
 }
 
+/// Allocates a lease for a client.
+async fn allocate_lease_for_client(
+    state: &mut State,
+    packet: &Packet,
+) -> Result<Option<Lease>, ()> {
+    // Chose an IP address for the client with priorities based on
+    // https://datatracker.ietf.org/doc/html/rfc2131#section-4.3.1:
+    // 1. The clients current "client address" (ciaddr) if the lease is valid.
+    // 2. The clients "client address" (ciaddr) if the lease is expired and in
+    //    the pool of available addresses.
+    // 3. The address requested in the "Requested Ip Address" option if available.
+    // 4. A server-chosen address.
+    let mac = packet.mac();
+
+    if !packet.ciaddr.is_unspecified() {
+        // If the lease is still in the pool it is still valid and we can offer
+        // if again.
+        if let Some(lease) = state.pool.get(mac) {
+            if lease.ip != packet.ciaddr {
+                tracing::warn!(
+                    "client thought he had {:?} but we know him as {:?}",
+                    packet.ciaddr,
+                    lease
+                );
+            }
+
+            state.pool.extend(mac);
+            state.database.insert(lease).await.unwrap();
+
+            let lease = state.pool.get(mac).unwrap();
+            return Ok(Some(lease));
+        }
+
+        // Client lease is expired but we attempt to allocate the requested client
+        // address of the client if it is available.
+        if let Some(lease) = state.pool.request_addr(mac, Some(packet.ciaddr)) {
+            state.database.insert(lease).await.unwrap();
+
+            return Ok(Some(lease));
+        }
+    }
+
+    let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
+        Some(opt) => match opt {
+            DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
+            _ => return Err(()),
+        },
+        None => None,
+    };
+
+    let lease = state.pool.request_addr(mac, requested_ip);
+    Ok(lease)
+}
+
 async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr, packet: Packet) {
+    let lease = match allocate_lease_for_client(state, &packet).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::error!("cannot offer lease, out of addresses");
+            return;
+        }
+        Err(()) => return,
+    };
+
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
         tracing::debug!("client has not requested any paramters");
         return;
@@ -113,22 +191,6 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
         DhcpOption::ParameterRequestList(params) => params,
         _ => return,
     };
-
-    let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
-        Some(opt) => match opt {
-            DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
-            _ => {
-                tracing::trace!("malformed packet");
-                return;
-            }
-        },
-        None => None,
-    };
-
-    let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
-
-    let ip = state.pool.request_addr(mac, requested_ip).unwrap();
-    state.database.insert(mac, ip).await.unwrap();
 
     let mut options = HashMap::new();
     options.insert(
@@ -191,7 +253,7 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
         secs: 0,
         flags: packet.flags,
         ciaddr: packet.ciaddr,
-        yiaddr: ip,
+        yiaddr: lease.ip,
         siaddr: state.config.local_addr,
         giaddr: packet.giaddr,
         chaddr: packet.chaddr,
@@ -203,14 +265,23 @@ async fn handle_discover(state: &mut State, socket: &UdpSocket, addr: SocketAddr
     let mut buf = Vec::new();
     resp.encode(&mut buf);
 
-    tracing::info!("offering {:?} to {:?}", ip, mac);
+    tracing::info!("offering {:?}", lease);
 
-    ioctl::arp_set(&socket, ip, mac).unwrap();
-    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 122, 255)), addr.port());
+    //ioctl::arp_set(&socket, ip, mac).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(state.config.broadcast), addr.port());
     socket.send_to(&buf, dst).await.unwrap();
 }
 
 async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr, packet: Packet) {
+    let lease = match allocate_lease_for_client(state, &packet).await {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
+            tracing::error!("cannot offer lease, out of addresses");
+            return;
+        }
+        Err(()) => return,
+    };
+
     let Some(params) = packet.options.get(&OptionCode::ParameterRequestList) else {
         tracing::debug!("client has not requested any paramters");
         return;
@@ -220,39 +291,6 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
         DhcpOption::ParameterRequestList(params) => params,
         _ => return,
     };
-
-    let requested_ip = match packet.options.get(&OptionCode::RequestedIpAddress) {
-        Some(opt) => match opt {
-            DhcpOption::RequestedIpAddress(addr) => Some(addr.0),
-            _ => {
-                tracing::trace!("malformed packet");
-                return;
-            }
-        },
-        None => None,
-    };
-
-    let mac = MacAddr::from_octets(packet.chaddr[0..6].try_into().unwrap());
-
-    let ip = if let Some(ip) = state.pool.get(mac) {
-        // We already have an IP registered for the MAC and reassign it.
-        ip
-    } else if packet.siaddr.is_unspecified() {
-        match state.pool.request_addr(mac, requested_ip) {
-            Some(ip) => ip,
-            None => {
-                tracing::error!(
-                    "cannot satisfy request from {:?}, out of free addresses",
-                    mac
-                );
-                return;
-            }
-        }
-    } else {
-        // Client already has an address and wants to renew.
-        packet.siaddr
-    };
-    state.database.insert(mac, ip).await.unwrap();
 
     let mut options = HashMap::new();
     options.insert(
@@ -315,7 +353,7 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
         secs: 0,
         flags: packet.flags,
         ciaddr: packet.ciaddr,
-        yiaddr: ip,
+        yiaddr: lease.ip,
         siaddr: state.config.local_addr,
         giaddr: packet.giaddr,
         chaddr: packet.chaddr,
@@ -327,8 +365,8 @@ async fn handle_request(state: &mut State, socket: &UdpSocket, addr: SocketAddr,
     let mut buf = Vec::new();
     resp.encode(&mut buf);
 
-    ioctl::arp_set(&socket, ip, mac).unwrap();
-    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 122, 255)), addr.port());
+    //ioctl::arp_set(&socket, lease.ip, mac).unwrap();
+    let dst = SocketAddr::new(IpAddr::V4(state.config.broadcast), addr.port());
     socket.send_to(&buf, dst).await.unwrap();
 }
 
@@ -353,6 +391,12 @@ pub struct Packet {
     pub sname: [u8; 64],
     pub file: [u8; 128],
     pub options: HashMap<OptionCode, DhcpOption>,
+}
+
+impl Packet {
+    pub fn mac(&self) -> MacAddr {
+        MacAddr::from_octets(self.chaddr[0..6].try_into().unwrap())
+    }
 }
 
 impl Encode for Packet {
